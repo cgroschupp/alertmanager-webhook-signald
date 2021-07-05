@@ -5,28 +5,33 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/jpillora/backoff"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gitlab.com/signald/signald-go/cmd/signaldctl/common"
+	"gitlab.com/signald/signald-go/signald"
+	v1 "gitlab.com/signald/signald-go/signald/client-protocol/v1"
+)
 
-	"github.com/dgl/alertmanager-webhook-signald/signald"
+const (
+	defaultSocketPath = "/var/run/signald/signald.sock"
 )
 
 var (
 	flagListen = flag.String("listen", ":9716", "[ip]:port to listen on for HTTP")
-	flagSocket = flag.String("signald", signald.DefaultPath, "UNIX socket to connect to signald on")
+	flagSocket = flag.String("signald", defaultSocketPath, "UNIX socket to connect to signald on")
 	flagConfig = flag.String("config", "", "YAML configuration filename")
 
-	signalClient    *signald.Client
-	cfg             *Config
-	receivers       = map[string]*Receiver{}
-	templates       *template.Template
-	lastKeepAliveID string
+	// signalClient    *signald.Client
+	cfg       *Config
+	receivers = map[string]*Receiver{}
+	templates *template.Template
+	connected bool
 )
 
 var (
@@ -49,21 +54,41 @@ var (
 			Subsystem: "signal",
 			Name:      "info",
 		}, []string{"name", "version"})
-	signaldLastKeepaliveMetric = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Namespace: "signald_webhook",
-			Subsystem: "signal",
-			Name:      "keepalive",
-		})
 )
 
 func init() {
-	prometheus.Register(receivedMetric)
-	prometheus.Register(errorsMetric)
-	prometheus.Register(signaldInfoMetric)
-	prometheus.Register(signaldLastKeepaliveMetric)
+	err := prometheus.Register(receivedMetric)
+	if err != nil {
+		log.Fatal("unable to register metric `received_total`")
+	}
+	err = prometheus.Register(errorsMetric)
+	if err != nil {
+		log.Fatal("unable to register metric `errors_total`")
+	}
+	err = prometheus.Register(signaldInfoMetric)
+	if err != nil {
+		log.Fatal("unable to register metric `info`")
+	}
 	for _, errorType := range []string{"decode", "handler"} {
 		errorsMetric.With(prometheus.Labels{"type": errorType}).Add(0)
+	}
+}
+
+func handleReconnect() {
+	b := &backoff.Backoff{}
+	for {
+		common.Signald = &signald.Signald{SocketPath: *flagSocket}
+		if err := common.Signald.Connect(); err != nil {
+			connected = false
+			d := b.Duration()
+			log.Printf("unable to connect: %s, retry in %s", err, d)
+			time.Sleep(d)
+			continue
+		}
+		b.Reset()
+		connected = true
+		common.Signald.Listen(nil)
+
 	}
 }
 
@@ -98,12 +123,7 @@ func main() {
 		log.Fatalf("Error parsing templates: %v", err)
 	}
 
-	signalClient, err = signald.NewPath(*flagSocket)
-	if err != nil {
-		log.Printf("Error connecting to signald: %v, will attempt to connect later", err)
-	}
-
-	prometheus.Register(prometheus.NewGaugeFunc(
+	err = prometheus.Register(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Namespace: "signald_webhook",
 			Subsystem: "signal",
@@ -111,156 +131,21 @@ func main() {
 			Help:      "True if connected to signald.",
 		},
 		func() float64 {
-			if signalClient.Connected() {
+			if connected {
 				return 1
 			}
 			return 0
 		},
 	))
-
-	// Subscribe if subscribe is true, this helps keep the signal connection alive, even if we don't
-	// do anything with the incoming messages.
-	subscribe := map[string]bool{}
-	for _, recv := range cfg.Receivers {
-		if recv.Subscribe != nil && *recv.Subscribe {
-			subscribe[recv.Sender] = true
-		}
-	}
-	for user := range subscribe {
-		signalClient.Encode(&signald.Subscribe{
-			Username: user,
-		})
+	if err != nil {
+		log.Fatal("unable to register metric `connected`")
 	}
 
-	go handleOutput()
-	go keepalive()
+	go handleReconnect()
 
 	http.HandleFunc("/alert", hook)
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(*flagListen, nil))
-}
-
-// Handles output from signald and deals with reconnection logic
-func handleOutput() {
-	backoff := 0.0
-	for {
-		for signalClient.Connected() {
-			res, err := signalClient.Decode()
-			if err != nil {
-				log.Print(err)
-				continue
-			}
-
-			log.Printf("%T: %v", res, res)
-			switch r := res.(type) {
-			case *signald.Version:
-				signaldInfoMetric.With(
-					prometheus.Labels{"name": r.Data["name"], "version": r.Data["version"]}).Set(1)
-			case *signald.User:
-				if r.ID == lastKeepAliveID {
-					signaldLastKeepaliveMetric.Set(float64(time.Now().Unix()))
-				}
-			case *signald.Message:
-				msg, ok := r.Data["dataMessage"].(map[string]interface{})
-				if !ok {
-					// typing etc
-					continue
-				}
-				source, ok := r.Data["source"].(string)
-				if !ok {
-					continue
-				}
-				username, ok := r.Data["username"].(string)
-				if !ok {
-					continue
-				}
-				handleCommand(username, source, msg)
-			}
-		}
-
-		time.Sleep(time.Duration(math.Pow(2, backoff)) * time.Second)
-		if backoff < 6 {
-			backoff += 1
-		}
-		if err := signalClient.Connect(); err != nil {
-			log.Printf("Failed to reconnect: %v", err)
-		} else {
-			log.Print("Connected to signald")
-			backoff = 0
-		}
-	}
-}
-
-func getGroupId(msg map[string]interface{}) string {
-	if info, ok := msg["groupInfo"].(map[string]interface{}); ok {
-		return info["groupId"].(string)
-	}
-	return ""
-}
-
-func handleCommand(username, source string, msg map[string]interface{}) {
-	if !cfg.Options.Commands {
-		return
-	}
-
-	allowed := false
-	groupId := getGroupId(msg)
-	for _, r := range cfg.Receivers {
-		for _, to := range r.To {
-			if strings.HasPrefix(to, "tel:") {
-				if to[4:] == source {
-					allowed = true
-				}
-			} else if len(groupId) > 0 && strings.HasPrefix(to, "group:") {
-				if to[6:] == groupId {
-					allowed = true
-				}
-			}
-		}
-	}
-	if !allowed {
-		log.Printf("Ignoring command from unknown source: %q, %v", source, msg)
-		return
-	}
-
-	text, ok := msg["message"].(string)
-	if !ok {
-		return
-	}
-
-	if strings.ToLower(text) == "ping" {
-		send := &signald.Send{
-			Username:    username,
-			MessageBody: "pong",
-		}
-		if msg["groupInfo"] != nil {
-			send.RecipientGroupID = groupId
-		} else {
-			send.RecipientAddress = &signald.JSONAddress{
-				Number: source,
-			}
-		}
-		if err := signalClient.Encode(send); err != nil {
-			log.Printf("Failed sending reply: %v", err)
-		}
-	}
-}
-
-func keepalive() {
-	if !cfg.Options.KeepAlive {
-		return
-	}
-	for {
-		req := &signald.GetUser{
-			Username: cfg.Defaults.Sender,
-			RecipientAddress: signald.JSONAddress{
-				Number: cfg.Defaults.Sender,
-			},
-		}
-		signalClient.Encode(req)
-		lastKeepAliveID = req.ID
-		time.Sleep(5 * time.Minute)
-	}
 }
 
 func hook(w http.ResponseWriter, req *http.Request) {
@@ -284,6 +169,7 @@ func hook(w http.ResponseWriter, req *http.Request) {
 }
 
 func handle(m *Message) error {
+
 	recv, ok := receivers[m.Receiver]
 	if !ok {
 		return fmt.Errorf("%q: Receiver not configured", m.Receiver)
@@ -296,10 +182,11 @@ func handle(m *Message) error {
 	}
 
 	for _, toTmpl := range recv.To {
-		send := &signald.Send{
+		req := v1.SendRequest{
 			Username:    recv.Sender,
 			MessageBody: body,
 		}
+
 		var to string
 		to, err = templates.ExecuteTextString(toTmpl, m)
 		if err != nil {
@@ -307,17 +194,17 @@ func handle(m *Message) error {
 			continue
 		}
 		if strings.HasPrefix(to, "tel:") {
-			send.RecipientAddress = &signald.JSONAddress {
-				Number: to[4:],
-			}
+			req.RecipientAddress = &v1.JsonAddress{Number: to[4:]}
 		} else if strings.HasPrefix(to, "group:") {
-			send.RecipientGroupID = to[6:]
+			req.RecipientGroupID = to[6:]
 		} else {
 			log.Printf("Unknown to: %q, expected tel:+number or group:id", to)
 		}
-		if te := signalClient.Encode(send); te != nil {
-			err = te
+		_, err := req.Submit(common.Signald)
+		if err != nil {
+			log.Fatal("error sending request to signald: ", err)
 		}
+
 	}
 	return err
 }
